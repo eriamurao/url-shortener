@@ -27,8 +27,9 @@ class UrlsController < ApplicationController
       end
 
     if redirect_url
-      # explicitly set the status to found (302) to indicate a temporary redirect and
-      # not a permanent redirect to account for visits to the short URL
+      # 302 (temporary) so browsers and caches do not permanently bind the short
+      # code to this destination. 301 would be wrong if the mapping is later
+      # updated or deleted.
       redirect_to redirect_url, status: :found, allow_other_host: true
     else
       head :not_found

@@ -184,5 +184,14 @@ RSpec.describe UrlMapping, type: :model do
       expect(Rails.logger).to have_received(:info).with('Generating mock data 1 of 2').ordered
       expect(Rails.logger).to have_received(:info).with('Generating mock data 2 of 2').ordered
     end
+
+    it 'uses deterministic https URLs' do
+      described_class.generate_mock_data(count: 2)
+
+      expect(described_class.last(2).map(&:redirect_url)).to contain_exactly(
+        'https://example.com/mock/1',
+        'https://example.com/mock/2'
+      )
+    end
   end
 end

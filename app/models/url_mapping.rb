@@ -15,7 +15,7 @@ class UrlMapping < ApplicationRecord
   def self.generate_mock_data(count: 100)
     count.times do |i|
       Rails.logger.info("Generating mock data #{i + 1} of #{count}")
-      UrlMapping.create(redirect_url: Faker::Internet.url)
+      UrlMapping.create!(redirect_url: "https://example.com/mock/#{i + 1}")
     end
   end
 

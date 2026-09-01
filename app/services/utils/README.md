@@ -32,7 +32,7 @@ The ordering is **convention only**. Encode and decode must use the same alphabe
 **Input:** integer. Intended use is **non-negative** ids (e.g. snowflake values).
 
 1. If the number is `0`, return the first alphabet character (`"0"`).
-2. If the number is **negative**, the `while number > 0` loop never runs, so the method returns **`""`** (empty string). There is no error.
+2. If the number is **negative**, or not an Integer (including `nil` and floats), `encode` raises `ArgumentError` with message `number must be a non-negative integer`.
 3. Otherwise, repeatedly take `number % 62`, map the remainder to a character via `ALPHABET`, integer-divide `number` by 62, until `number` is 0.
 4. The remainders are produced least-significant digit first; **reverse** the collected characters and join to get the final string.
 
@@ -42,9 +42,10 @@ Example in this app: [`UrlMapping`](../../../models/url_mapping.rb) sets `url_co
 
 **Input:** base62 string (characters must all appear in `ALPHABET`).
 
-1. Walk left to right. Maintain an accumulator starting at `0` (so an **empty string** decodes to `0`).
-2. For each character: `acc = acc * 62 + index_of(char)` in `ALPHABET`.
-3. Return the final integer.
+1. Reject blank/`nil` input (`cannot decode empty string`) and non-strings (`input must be a string`).
+2. Walk left to right. Maintain an accumulator starting at `0`.
+3. For each character: `acc = acc * 62 + index_of(char)` in `ALPHABET`.
+4. Return the final integer.
 
 **Round-trip:**
 
@@ -56,6 +57,6 @@ This app does **not** call `decode` for short codes—only `encode` when creatin
 ## Notes / gotchas
 
 - **Invalid characters:** `decode` raises `ArgumentError` with message `invalid base62 character: ...` if any character is not in `ALPHABET`. Handle that at the call site (e.g. treat as unknown url code) or validate before decoding.
-- **Negative numbers:** `encode(-n)` returns an empty string `""`, not an error. Validate non-negative inputs at the call site if that matters (e.g. snowflake ids).
-- **Leading zeros:** `encode` never emits redundant leading zeros (`encode(1)` is always `"1"`, never `"01"`). `decode` is **permissive**: `"1"`, `"01"`, and `"001"` all decode to `1`; `"0"`, `"00"`, and `""` all decode to `0`. Strings that **start** with `0` are not always zero (e.g. `"0a"` → `10`). No extra handling is required for short codes (DB lookup by exact `url_code`).
-- **Not covered:** no validation for `nil` or non-integer `encode` inputs; callers should pass integers. `decode` uses linear `ALPHABET.index` per character—fine for short codes.
+- **Invalid encode inputs:** `encode` raises `ArgumentError` for negative numbers, `nil`, and non-integers. Empty or `nil` decode input raises `cannot decode empty string`; non-string decode input raises `input must be a string`.
+- **Leading zeros:** `encode` never emits redundant leading zeros (`encode(1)` is always `"1"`, never `"01"`). `decode` is **permissive**: `"1"`, `"01"`, and `"001"` all decode to `1`; `"0"` and `"00"` decode to `0`. Strings that **start** with `0` are not always zero (e.g. `"0a"` → `10`). No extra handling is required for short codes (DB lookup by exact `url_code`).
+- **Decode lookup:** `decode` uses linear `ALPHABET.index` per character—fine for short codes.

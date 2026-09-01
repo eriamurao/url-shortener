@@ -15,6 +15,15 @@ RSpec.describe Snowflake::GeneratorService do
     id & described_class::MAX_SEQUENCE
   end
 
+  before do
+    allow(Socket).to receive(:gethostname).and_return('test-host')
+    described_class.reset!
+  end
+
+  after do
+    described_class.reset!
+  end
+
   describe '#next_id' do
     it 'returns a positive integer' do
       id = described_class.instance.next_id
@@ -88,6 +97,35 @@ RSpec.describe Snowflake::GeneratorService do
         collected = 200.times.map { ids.pop }
         expect(collected.uniq.size).to eq(200)
       end
+    end
+  end
+
+  describe '.instance' do
+    it 'returns the same object on repeated calls' do
+      expect(described_class.instance).to equal(described_class.instance)
+    end
+
+    it 'does not allow GeneratorService.new' do
+      expect { described_class.new }.to raise_error(NoMethodError, /private method ['`]new['`]/)
+    end
+
+    it 'returns one instance when first called concurrently' do
+      described_class.reset!
+      instances = Queue.new
+      threads = Array.new(8) { Thread.new { instances << described_class.instance } }
+      threads.each(&:join)
+
+      collected = 8.times.map { instances.pop }
+      expect(collected.uniq.size).to eq(1)
+    end
+  end
+
+  describe 'machine id' do
+    it 'uses the trailing digits of the hostname' do
+      allow(Socket).to receive(:gethostname).and_return('url-shortener-2')
+      described_class.reset!
+
+      expect(machine_id_from(described_class.instance.next_id)).to eq(2)
     end
   end
 end

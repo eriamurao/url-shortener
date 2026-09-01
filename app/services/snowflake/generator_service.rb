@@ -1,6 +1,8 @@
+require 'socket'
+
 module Snowflake
   class GeneratorService
-    include Singleton
+    INIT_MUTEX = Mutex.new
 
     CUSTOM_EPOCH = 1785542400000 # 2026-07-31 00:00:00 UTC
 
@@ -12,16 +14,28 @@ module Snowflake
     # Binary: 1111 1111 1111
     MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1
 
+    def self.instance
+      return @instance if @instance
+
+      INIT_MUTEX.synchronize { @instance ||= new }
+    end
+
+    def self.reset!
+      INIT_MUTEX.synchronize { @instance = nil }
+    end
+
+    private_class_method :new
+
     def initialize
       @last_timestamp = -1
       @machine_id = machine_id
       @sequence = 0
 
-      @mutex = Mutex.new
+      @next_id_mutex = Mutex.new
     end
 
     def next_id
-      @mutex.synchronize do
+      @next_id_mutex.synchronize do
         timestamp = current_timestamp_in_milliseconds
 
         if timestamp == @last_timestamp
@@ -61,7 +75,9 @@ module Snowflake
     end
 
     # Note: This is a temporary solution to get the machine ID.
-    # This works for Kubernetes pods because it guarantees unique ordinal across all pods.
+    # This only works on servers with single cluster mode.
+    # TODO: Update this to use a more robust machine ID generation strategy
+    # for multi-cluster multi-server deployments.
     def machine_id
       hostname = Socket.gethostname
       hostname[/\d+\z/].to_i
