@@ -8,7 +8,7 @@
 - **Opaque slugs** after Base62 encoding (unlike guessable sequential ids).
 - **High create rate:** many ids can be minted in the same millisecond via the **sequence** field; a **mutex** prevents duplicate ids from concurrent threads on the **same generator instance**.
 
-Race conditions on id generation are the main concurrency concern at high request rates; `next_id` runs entirely inside `@mutex.synchronize`.
+Race conditions on id generation are the main concurrency concern at high request rates; `next_id` runs entirely inside `@next_id_mutex.synchronize`.
 
 ## ID layout
 
