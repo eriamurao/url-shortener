@@ -1,0 +1,7 @@
+---
+description: Default Jira rules
+alwaysApply: true
+---
+
+- Project key: **US**
+- Create tickets as Task unless the user asks for Bug or Story
