@@ -33,10 +33,10 @@ Those scale numbers imply a write-heavy create path (~1.2k/s average, much highe
 
 Creates must hit a **primary**. Redirects are read-only and should not compete with writes on that same instance.
 
-[`ApplicationRecord`](app/models/application_record.rb) declares the two roles:
+[`ApplicationRecord`](app/models/application_record.rb) declares the two roles in development and production (not in test):
 
 ```ruby
-connects_to database: { writing: :primary, reading: :primary_replica }
+connects_to database: { writing: :primary, reading: :primary_replica } unless Rails.env.test?
 ```
 
 [`ApplicationController`](app/controllers/application_controller.rb) picks the role per request with `connected_to` — **GET/HEAD → replica**, everything else → **primary**. No session, no cookies: this is an API-only app, and the default Rails `DatabaseSelector` (`Resolver::Session`) needs a session store we do not want to add back.
@@ -45,6 +45,8 @@ connects_to database: { writing: :primary, reading: :primary_replica }
 around_action :route_to_correct_database
 
 def route_to_correct_database
+  return yield if Rails.env.test?
+
   role = request.get? || request.head? ? :reading : :writing
   ActiveRecord::Base.connected_to(role: role) { yield }
 end
@@ -53,7 +55,11 @@ end
 - **Writes** (`POST /urls/shorten`) go to `primary`.
 - **Reads** (`GET /urls/:id` cache misses) go to `primary_replica`.
 
-Replica hosts/users are in [`config/database.yml`](config/database.yml) (`primary` + `primary_replica` in development, test, and production). `GET /up` uses Rails’ health controller, not `ApplicationController`, so it does not go through this switch.
+Replica hosts/users are in [`config/database.yml`](config/database.yml) (`primary` + `primary_replica` in **development** and **production**). Test is **primary only** — no replica config, no `connected_to` switch — so request specs and transactional fixtures share one connection. `GET /up` uses Rails’ health controller, not `ApplicationController`, so it does not go through this switch.
+
+### Why test has no replica
+
+RSpec uses **transactional fixtures**: each example inserts on the writing connection inside a transaction, then rolls back. A replica (or even a second pool to the same Postgres) is a **different connection**. It cannot see those uncommitted rows, so `POST`/`create` then `GET` 404s or fails to connect — that is a test-harness lie, not a product bug. Making a standby honest in specs means dropping transactional fixtures, waiting on WAL, and running a second Postgres in CI. A local replica also will not reproduce production lag (apply is milliseconds). Request specs should prove create-then-redirect on **one** connection; replica routing stays development/production. First-click 404 from lag is [issue 1](#1-high-first-redirect-after-create-can-404-replica-lag), not something `bundle exec rspec` is meant to catch.
 
 **Replica lag:** a code created and visited before the replica catches up can 404. The Rails session-based 2-second “read your writes” delay would not help much here anyway — the creator’s POST and a visitor’s GET are usually different clients. Caching on the redirect path (below) absorbs repeat reads; the replica mainly needs to keep up with *new* codes. Tracked as [issue 1](#1-high-first-redirect-after-create-can-404-replica-lag).
 
@@ -136,13 +142,13 @@ The redirect path (`GET /urls/:id`) is read-heavy. [`UrlsController#show`](app/c
 
 | Environment | Store | Notes |
 |-------------|-------|-------|
-| **Development** | Redis (`redis_cache_store`) | Requires local Redis; see [App setup](#app-setup). Shared across Puma workers. |
-| **Production** | Solid Cache (`solid_cache_store`) | DB-backed; no Redis dependency for redirects. |
-| **Test** | `:null_store` in config; request specs swap in `MemoryStore` where needed | |
+| **Development** | Redis (`redis_cache_store`) | Requires local Redis; see [App setup](#app-setup). Shared across Puma workers. Falls back to `redis://127.0.0.1:6379`. |
+| **Production** | Redis (`redis_cache_store`) | Requires `REDIS_URL` (no default). Shared across app servers so hot codes skip PostgreSQL. |
+| **Test** | `:null_store` in config; request specs swap in `MemoryStore` where needed | No Redis. |
 
 Entries expire after **one hour** via `expires_in`. There is no application-level LRU.
 
-For 10B redirects/day, a shared cache in front of the replica is the intended pattern: hot codes never touch PostgreSQL. Development uses Redis for that locally; production uses Solid Cache.
+For 10B redirects/day, a shared Redis cache in front of the replica is the intended pattern: hot codes never touch PostgreSQL. Development and production both use Redis for that. The `solid_cache` gem and production `cache` database remain in the repo (Rails 8 Solid stack leftovers) but are not the `Rails.cache` store.
 
 ## Redirect: `302 Found` vs `301 Moved Permanently`
 
@@ -245,20 +251,20 @@ Brakeman flags **open redirects** on `redirect_to` with `allow_other_host: true`
 |-------|------|------|
 | Routes | [`config/routes.rb`](config/routes.rb) | `resources :urls`, collection `shorten` |
 | Controller | [`app/controllers/urls_controller.rb`](app/controllers/urls_controller.rb) | Create mapping, 302 redirect on show |
-| ApplicationController | [`app/controllers/application_controller.rb`](app/controllers/application_controller.rb) | GET/HEAD → replica, other verbs → primary |
+| ApplicationController | [`app/controllers/application_controller.rb`](app/controllers/application_controller.rb) | GET/HEAD → replica, other verbs → primary (skipped in test) |
 | Model | [`app/models/url_mapping.rb`](app/models/url_mapping.rb) | URL validation, snowflake + Base62 on create, cache invalidation |
-| ApplicationRecord | [`app/models/application_record.rb`](app/models/application_record.rb) | `connects_to` writing: primary, reading: primary_replica |
+| ApplicationRecord | [`app/models/application_record.rb`](app/models/application_record.rb) | `connects_to` writing: primary, reading: primary_replica (not in test) |
 | Snowflake | [`app/services/snowflake/generator_service.rb`](app/services/snowflake/generator_service.rb) | Time-ordered 64-bit ids (process singleton + mutex) |
 | Base62 | [`app/services/utils/base62_service.rb`](app/services/utils/base62_service.rb) | Compact URL-safe `url_code` |
 | Rate limit | [`config/initializers/rack_attack.rb`](config/initializers/rack_attack.rb) | IP throttles for create and redirect |
 | Schema | [`db/schema.rb`](db/schema.rb) | `url_mappings` + unique index |
-| Database | [`config/database.yml`](config/database.yml) | `primary` + `primary_replica` |
+| Database | [`config/database.yml`](config/database.yml) | `primary` + `primary_replica` (dev/prod); test is `primary` only |
 
 ## Tests
 
 | Spec | Covers |
 |------|--------|
-| [`spec/requests/urls_spec.rb`](spec/requests/urls_spec.rb) | HTTP API (create + redirect + 404), cache hits/misses, format guards |
+| [`spec/requests/urls_spec.rb`](spec/requests/urls_spec.rb) | HTTP API (create + redirect + 404), cache hits/misses, format guards. Runs against a single test DB (no replica). |
 | [`spec/requests/rack_attack_spec.rb`](spec/requests/rack_attack_spec.rb) | Create throttle (429), health-check safelist |
 | [`spec/models/url_mapping_spec.rb`](spec/models/url_mapping_spec.rb) | Validations, `url_code` generation, cache invalidation |
 | [`spec/services/utils/base62_service_spec.rb`](spec/services/utils/base62_service_spec.rb) | Slug encode/decode |
@@ -267,6 +273,8 @@ Brakeman flags **open redirects** on `redirect_to` with `allow_other_host: true`
 ```bash
 bundle exec rspec
 ```
+
+No replica in test: transactional fixtures and a reading-role connection cannot see the same uncommitted rows. Details under [Why test has no replica](#why-test-has-no-replica).
 
 ## Related notes (single-topic)
 
@@ -325,15 +333,15 @@ Postgres **async streaming** (the default; Rails `replica: true` does not wait f
 - 15 s covers typical under-load lag (1–5 s) plus buffer, without ~4.2M keys. Bump to **30 s** only if `replay_lag` regularly sits above ~5–10 s.
 - Do **not** ship A. Do **not** add C in the same change; primary fallback is the follow-on if 15 s is not enough during lag spikes.
 
-Not in this issue: test/CI replica routing (separate), Snowflake `machine_id` collisions (separate).
+Not in this issue: Snowflake `machine_id` collisions (separate). Test does not use a replica (see [Handling reads vs writes](#handling-reads-vs-writes)).
 
 ## App setup
 
 Ruby **4.0.2**, Rails **8.1**, PostgreSQL. From the project root you can use `bin/setup`, or the steps below.
 
-### 1. Redis (required in development)
+### 1. Redis (required in development and production)
 
-Development uses `redis_cache_store` for the redirect cache and Rack::Attack counters. Tests use `:null_store` and do not need Redis.
+Development and production use `redis_cache_store` for the redirect cache and Rack::Attack counters. Tests use `:null_store` and do not need Redis. Production boots only if `REDIS_URL` is set.
 
 **Ubuntu / WSL**
 
@@ -350,7 +358,7 @@ brew install redis
 brew services start redis
 ```
 
-Confirm with `redis-cli ping` (`PONG`). Override the default with `REDIS_URL` (falls back to `redis://127.0.0.1:6379`).
+Confirm with `redis-cli ping` (`PONG`). In development, `REDIS_URL` is optional and falls back to `redis://127.0.0.1:6379`. In production, set `REDIS_URL` (no fallback).
 
 ### 2. PostgreSQL primary + replica
 
@@ -361,7 +369,7 @@ Confirm with `redis-cli ping` (`PONG`). Override the default with `REDIS_URL` (f
 | **Primary** (writes) | `localhost` | `5432` | `url_shortener_development` | `postgres` / `postgres` |
 | **Replica** (reads) | `localhost` | `5433` | `url_shortener_development` | `postgres_readonly` / `postgres_readonly` |
 
-Test uses the same ports with database `url_shortener_test`. Production uses `URL_SHORTENER_DATABASE_PASSWORD` and `URL_SHORTENER_READONLY_DATABASE_PASSWORD`.
+**Test** uses primary only: `url_shortener_test` on `localhost:5432` (same Postgres as the primary, no replica). Production uses `URL_SHORTENER_DATABASE_PASSWORD` and `URL_SHORTENER_READONLY_DATABASE_PASSWORD`.
 
 **Primary.** Install PostgreSQL and create the app user/database, or run:
 
@@ -410,9 +418,9 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO postgres_readonly;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO postgres_readonly;
 ```
 
-Repeat `GRANT CONNECT` / `GRANT SELECT` for `url_shortener_test` after `bin/rails db:prepare`.
+Tests do not need the replica or `postgres_readonly`. `bundle exec rspec` only needs primary on 5432 and `url_shortener_test`.
 
-If you only have a single Postgres on 5432 and no replica yet, the app will fail to connect to `primary_replica` on 5433. Bring the replica up, or temporarily point `primary_replica` at the same host/port (still `replica: true` so Rails will not write to it).
+If you only have a single Postgres on 5432 and no replica yet, **development** and **production** will fail to connect to `primary_replica` on 5433. Bring the replica up, or temporarily point `primary_replica` at the same host/port (still `replica: true` so Rails will not write to it). Test is unaffected.
 
 ### 3. App
 
@@ -431,4 +439,4 @@ Or `bin/setup` (installs gems, prepares the DB, starts `bin/dev`).
 bundle exec rspec
 ```
 
-CI (`bin/ci`) also runs Brakeman, bundler-audit, and RuboCop. The GitHub Actions test job currently starts **primary Postgres only**; replica-backed request routing is exercised when a replica is available locally.
+CI (`bin/ci`) also runs Brakeman, bundler-audit, and RuboCop. The GitHub Actions test job starts **primary Postgres only**, which matches test config (no replica). Replica routing is development/production only.

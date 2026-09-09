@@ -91,7 +91,7 @@ builder:
 #   user: app
 
 # Use accessory services (secrets come from .kamal/secrets).
-# accessories:
+accessories:
 #   db:
 #     image: mysql:8.0
 #     host: 192.168.0.2
@@ -107,9 +107,9 @@ builder:
 #       - db/production.sql:/docker-entrypoint-initdb.d/setup.sql
 #     directories:
 #       - data:/var/lib/mysql
-#   redis:
-#     image: valkey/valkey:8
-#     host: 192.168.0.2
-#     port: 6379
-#     directories:
-#       - data:/data
+  redis:
+    image: valkey/valkey:8
+    host: 192.168.0.2
+    port: 6379
+    directories:
+      - data:/data

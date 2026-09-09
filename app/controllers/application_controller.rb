@@ -4,6 +4,8 @@ class ApplicationController < ActionController::API
   private
 
   def route_to_correct_database
+    return yield if Rails.env.test?
+
     role = request.get? || request.head? ? :reading : :writing
     ActiveRecord::Base.connected_to(role: role) do
       yield
