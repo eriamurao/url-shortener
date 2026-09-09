@@ -1,7 +1,42 @@
 ---
-description: Default Jira rules
-alwaysApply: true
+description: Use when creating, searching, updating, or triaging Jira tickets, issues, sprints, or bugs. Default project is US; default issue type is Task; default priority is Normal.
+alwaysApply: false
 ---
 
-- Project key: **US**
-- Create tickets as Task unless the user asks for Bug or Story
+# Jira
+
+- Default project key: **US** (URL Shortener)
+- Create tickets as **Task** unless the user asks for Bug or Story
+- Default priority is **Normal**. Use High or Low only when the user says so
+- Do not ask which project to use unless the user names a different one
+- Use the official Atlassian MCP (OAuth). Never put API tokens, emails, or passwords in tickets, rules, or commits.
+- Never include Jira issue URLs (browse links, `atlassian.net/browse/…`, markdown links to tickets). Issue keys like `US-5` are fine as plain text.
+
+## README issues
+
+[`README.md`](README.md) has an **Issues to fix** section. When you **update** a Jira ticket, if that same issue is already listed there, update that README entry so it stays aligned (status, recommended fix, scope). If it is **not** already in the README, do not add it and do not change the Issues section. Do not put issue URLs in the README.
+
+## Description format
+
+Write descriptions as Markdown and save them as Atlassian document format (official MCP `contentFormat: markdown`). Jira Cloud does not treat `**Details**` as a heading; that shows up as literal asterisks.
+
+- Section titles are `###` headings (not `##`, not bold-only lines)
+- Standard sections: Details, Background, Scope, Accepted Criteria, Out of scope, Notes
+- Omit a section if it has nothing useful
+- After create, return the issue key only (no browse URL)
+
+```markdown
+<!-- ❌ BAD: bold-only "headers" stay as **Details** -->
+**Details**
+Add rate limiting.
+
+<!-- ✅ GOOD -->
+### Details
+
+Redirects are the hot path. Unbounded `GET /urls/:code` can overwhelm the replica.
+
+### Accepted Criteria
+
+- Over-limit responses return 429 JSON and a Retry-After header
+- Create traffic is not blocked by the redirect limiter
+```

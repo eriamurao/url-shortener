@@ -1,16 +1,3 @@
 {
-  "mcpServers": {
-    "jira": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@bodywave/jira-mcp"
-      ],
-      "env": {
-        "JIRA_URL": "{env:JIRA_URL}",
-        "JIRA_EMAIL": "{env:JIRA_EMAIL}",
-        "JIRA_API_TOKEN": "{env:JIRA_API_TOKEN}"
-      }
-    }
-  }
+  "mcpServers": {}
 }

@@ -55,7 +55,7 @@ end
 
 Replica hosts/users are in [`config/database.yml`](config/database.yml) (`primary` + `primary_replica` in development, test, and production). `GET /up` uses Rails’ health controller, not `ApplicationController`, so it does not go through this switch.
 
-**Replica lag:** a code created and visited before the replica catches up can 404. The Rails session-based 2-second “read your writes” delay would not help much here anyway — the creator’s POST and a visitor’s GET are usually different clients. Caching on the redirect path (below) absorbs repeat reads; the replica mainly needs to keep up with *new* codes.
+**Replica lag:** a code created and visited before the replica catches up can 404. The Rails session-based 2-second “read your writes” delay would not help much here anyway — the creator’s POST and a visitor’s GET are usually different clients. Caching on the redirect path (below) absorbs repeat reads; the replica mainly needs to keep up with *new* codes. Tracked as [issue 1](#1-high-first-redirect-after-create-can-404-replica-lag).
 
 ## Collision handling
 
@@ -280,6 +280,52 @@ bundle exec rspec
 - [ ] Unique Snowflake `machine_id` per Puma worker / cluster
 - [ ] Bounded `RecordNotUnique` retry on create
 - [ ] Analytics table + redirect logging
+
+## Issues to fix
+
+Add an item here only after we have discussed the problem and agreed a direction. This is the working list of known bugs, not a brainstorm.
+
+### 1. [High] First redirect after create can 404 (replica lag)
+
+**Jira:** US-5 (Bug, High)
+
+**Status:** open — recommended fix agreed, not implemented. Ticket created.
+
+`POST /urls/shorten` writes to **primary**. `GET /urls/:id` always uses the **replica**. The cache is filled only inside `Rails.cache.fetch` on a **successful replica read**, with `skip_nil: true` and `expires_in: 1.hour`. Create does not write the cache.
+
+First click after create (often the creator):
+
+1. Cache miss
+2. Replica `find_by` — row not replayed yet
+3. `nil` is not cached (`skip_nil: true`, so a later GET can succeed)
+4. Client still gets **404**
+
+`skip_nil` is correct so we do not cache “does not exist.” It does not fix the 404 on *this* request. A session-based “read your writes” delay would not help: the POST client and the GET client are usually different.
+
+At the stated create rate (**100M/day ≈ 1,157/s**), any cache fill on create must stay small. The 1-hour GET TTL is for **codes that were actually requested**, not for every new slug.
+
+#### Approaches
+
+| Approach | What it does | Tradeoff |
+|----------|----------------|----------|
+| **A. Write-through on create, 1 hour TTL** | `Rails.cache.write` after save, same TTL as GET | Steady state ≈ **4.2M** extra keys (`1,157/s × 3,600`). Most new codes are never clicked in that hour. Pollutes the working set: LRU can evict a hot redirect to keep a cold create. **1,157 cache writes/s** on top of mapping inserts — painful on Solid Cache (Postgres), less so on Redis. |
+| **B. Write-through on create, short TTL** | Same write, TTL ≈ replica-lag window (seconds) | Covers “I just created this and clicked it.” Unclicked keys expire quickly. At 15s: ≈ **17k** keys; at 30s: ≈ **35k**. Still 1,157 cache writes/s, but the cache stays a first-click buffer, not a warehouse of all creates. If replay lag exceeds TTL (maintenance, replica overloaded), GET misses cache, replica still empty → **404** again. |
+| **C. Primary fallback on cache + replica miss** | GET: cache → replica → **one** primary read → 404 | No extra cache write on create. Cache stays demand-driven (1 hour, only codes that were hit). Extra primary load only on first miss or real 404s — probes would hit primary too (mitigated by code-format check + redirect throttle). Does not fill the cache with unused creates. |
+| **D. A+C or B+C** | Short-TTL write-through **and** primary fallback | First click usually served from cache; primary is the safety net when TTL expired or the write never landed. More moving parts than one of B or C alone. |
+| **E. Synchronous replication** | Primary commit waits until the replica has applied (`synchronous_standby_names` / `remote_apply`) | Replica lag for this path goes to ~0. Every create pays replica RTT + apply. Same-AZ is often a few ms; cross-region is worse. Write availability now depends on the replica. Ops change, not an app-only fix. |
+
+Postgres **async streaming** (the default; Rails `replica: true` does not wait for the standby) has **no fixed sync interval**. Healthy same-AZ lag is typically **10–100 ms**; under write load **1–5 s** can be normal; vacuum, big indexes, or a read-saturated replica can spike to **minutes**. Measure `replay_lag` on the primary via `pg_stat_replication`. The GET usually arrives after a client RTT (often 100–500 ms+), so average lag is already gone; TTL has to cover the **slow tail**, not the mean.
+
+#### Recommended fix
+
+**B — write the cache on successful create with a short TTL, starting at 15 seconds.**
+
+- After `mapping.save`, write `UrlMapping.cache_key(code)` → `safe_redirect_url` with `expires_in: 15.seconds` (named constant).
+- Leave the GET path as it is for now: cache fetch at **1 hour**, replica on miss, `skip_nil: true`. Do not use the 1-hour TTL on create.
+- 15 s covers typical under-load lag (1–5 s) plus buffer, without ~4.2M keys. Bump to **30 s** only if `replay_lag` regularly sits above ~5–10 s.
+- Do **not** ship A. Do **not** add C in the same change; primary fallback is the follow-on if 15 s is not enough during lag spikes.
+
+Not in this issue: test/CI replica routing (separate), Snowflake `machine_id` collisions (separate).
 
 ## App setup
 
