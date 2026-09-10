@@ -217,7 +217,7 @@ Table: **`url_mappings`**
 | Column | Type | Notes |
 |--------|------|--------|
 | `url_code` | `string`, NOT NULL | Public slug (Base62 snowflake id); lookup key for redirects |
-| `redirect_url` | `string`, NOT NULL | Full `http`/`https` URL |
+| `redirect_url` | `string`, NOT NULL | Full `http`/`https` URL; app caps length at `UrlMapping::MAX_REDIRECT_URL_LENGTH` (**2048**) |
 | `created_at` / `updated_at` | `datetime` | Standard Rails timestamps |
 
 **Indexes**
@@ -239,11 +239,11 @@ Rails routes: `resources :urls, only: [:show]` plus collection route `post :shor
 
 ## Validation and security
 
-On create, `redirect_url` must be present and parse as **`URI::HTTP` / `URI::HTTPS`** with a non-empty **host** (see `long_url_must_be_valid` on [`UrlMapping`](app/models/url_mapping.rb)). Malformed URIs and non-http(s) schemes are rejected before insert. The redirect path calls `safe_redirect_url` again so a bad value written outside validations still 404s instead of redirecting.
+On create, `redirect_url` must be a **String**, present, at most **`MAX_REDIRECT_URL_LENGTH` (2048)** characters, and parse as **`URI::HTTP` / `URI::HTTPS`** with a non-empty **host** (see `long_url_must_be_valid` on [`UrlMapping`](app/models/url_mapping.rb)). Non-strings, oversized payloads, malformed URIs, and non-http(s) schemes are rejected before insert. The redirect path calls `safe_redirect_url` again (also requiring a String) so a bad value written outside validations still 404s instead of redirecting.
 
 `url_code` must match **`URL_CODE_FORMAT`** (`4–11` alphanumeric characters) on create and on the redirect path. Invalid codes return **404** without a DB lookup.
 
-Brakeman flags **open redirects** on `redirect_to` with `allow_other_host: true`; that is intentional for a shortener, gated by the validation above. The ignore entry lives in [`config/brakeman.ignore`](config/brakeman.ignore). After changing the redirect, run `bin/rails brakeman:sync_ignore`.
+Brakeman flags **open redirects** on `redirect_to` with `allow_other_host: true`; that is intentional for a shortener, gated by the validation above. The ignore note in [`config/brakeman.ignore`](config/brakeman.ignore) documents the re-check via `UrlMapping#safe_redirect_url`. After changing the redirect, run `bin/rails brakeman:sync_ignore`.
 
 ## Files
 
@@ -285,13 +285,13 @@ No replica in test: transactional fixtures and a reading-role connection cannot 
 
 ## Follow-ups
 
-- [ ] Unique Snowflake `machine_id` per Puma worker / cluster
+- [ ] Unique Snowflake `machine_id` per Puma worker / cluster — tracked as [US-8](#4-high-harden-snowflake-generator-worker-machine_id-overflow-clock)
 - [ ] Bounded `RecordNotUnique` retry on create
 - [ ] Analytics table + redirect logging
 
 ## Issues to fix
 
-Add an item here only after we have discussed the problem and agreed a direction. This is the working list of known bugs, not a brainstorm.
+Add an item here only after we have discussed the problem and agreed a direction. This is the working list of tracked issues, not a brainstorm.
 
 ### 1. [High] First redirect after create can 404 (replica lag)
 
@@ -333,7 +333,97 @@ Postgres **async streaming** (the default; Rails `replica: true` does not wait f
 - 15 s covers typical under-load lag (1–5 s) plus buffer, without ~4.2M keys. Bump to **30 s** only if `replay_lag` regularly sits above ~5–10 s.
 - Do **not** ship A. Do **not** add C in the same change; primary fallback is the follow-on if 15 s is not enough during lag spikes.
 
-Not in this issue: Snowflake `machine_id` collisions (separate). Test does not use a replica (see [Handling reads vs writes](#handling-reads-vs-writes)).
+### 2. [Low] Deepen health check for Postgres and Redis
+
+**Jira:** US-6 (Task, Low)
+
+**Status:** open — direction agreed, not implemented. Ticket created.
+
+`GET /up` uses `rails/health#show`, which only proves the process booted. It does not touch Postgres or Redis. A load balancer can keep sending creates and redirects after the data path or cache is dead.
+
+Critical-path deps today:
+
+| Service | Role |
+|---------|------|
+| **Postgres primary** | Creates (`POST /urls/shorten`) |
+| **Postgres replica** | Redirect cache misses (`GET /urls/:id`) |
+| **Redis** | `Rails.cache` for redirects and Rack::Attack counters |
+
+#### Recommended fix
+
+Add a **health checker service** plus a controller that returns **200** when all required checks pass, otherwise **503**, with per-check status in the JSON body.
+
+- **Postgres:** `SELECT 1` (or equivalent) on **primary** and **primary_replica** outside test; **primary only** in test (no replica config).
+- **Redis:** short-lived `Rails.cache` write/read of a namespaced key (exercises the store the app uses, not only a raw PING).
+- Hard-fail when any required check fails (including replica outside test).
+- Keep probes cheap — no queries against `url_mappings`.
+- Safelist the health path in Rack::Attack (already true for `/up`).
+
+**Routing:** deepen `/up` if the load balancer has a single probe and will not restart on 503. If the orchestrator uses `/up` as **liveness** (restart on failure), keep Rails `/up` and put deep checks on **`/ready`** so Redis flaps do not crash-loop pods. Pick one when wiring deploy config.
+
+### 3. [Medium] Enable production Host allowlist and SSL (ops-gated)
+
+**Jira:** US-7 (Task, Medium)
+
+**Status:** open — direction agreed, not implemented. Ticket created.
+
+**Ops / deploy first** — small change in [`config/environments/production.rb`](config/environments/production.rb), real risk is flipping flags without a TLS-terminating proxy and the real hostname wired in env.
+
+Today `assume_ssl`, `force_ssl`, and `config.hosts` are commented out. [`UrlsController#shorten`](app/controllers/urls_controller.rb) builds `short_url` with `url_url`, which uses the request Host (and scheme). A forged Host poisons the JSON the client stores; missing SSL assumption can yield `http://` links behind a proxy. [`config/deploy.yml`](config/deploy.yml) already notes that an SSL proxy expects `assume_ssl` / `force_ssl`.
+
+#### Recommended fix
+
+- Enable `assume_ssl` and `force_ssl` when traffic terminates TLS at the reverse proxy; exclude health path(s) via `ssl_options` (`/up`, and `/ready` if US-6 adds it).
+- Enable `config.hosts` from env (e.g. `APP_HOST` / allowlist); exclude health path(s) via `host_authorization`.
+- Optionally pin `default_url_options` (host + `https`) from the same env so `short_url` is canonical even if the allowlist is later widened.
+- Wire env in deploy config; document that this must not be enabled without proxy + real hostname (wrong `hosts` → **403 everything**; bad SSL setup → redirect loops).
+
+### 4. [High] Harden Snowflake generator (worker machine_id, overflow, clock)
+
+**Jira:** US-8 (Bug, High)
+
+**Status:** open — all three items agreed, not implemented. Ticket created.
+
+[`Snowflake::GeneratorService`](app/services/snowflake/generator_service.rb) packs `timestamp (41) | machine_id (10) | sequence (12)`. Within **one** process the mutex keeps ids unique. Three related gaps:
+
+1. **Shared `machine_id` across Puma workers** — `machine_id` is hostname trailing digits (else `0`). `before_worker_boot` resets the singleton but workers on the same host still share that ordinal → colliding ids under load.
+2. **No 10-bit guard** — values ≥ 1024 spill into the timestamp field and corrupt ids. The field allows **1024 concurrent minting processes** (`0..1023`) fleet-wide — **not** 1023 ids/sec. Each process can still mint thousands of ids per ms via sequence.
+3. **Clock step-back / unbounded wait** — `current < last` resets sequence and packs the earlier wall time → duplicates; `wait_for_next_millisecond` busy-spins with no timeout.
+
+Uniqueness target: unique `machine_id` per **(pod/server × worker process)**. Threads in one worker share one generator and do **not** need their own id.
+
+#### Item 1 — Unique machine_id across workers
+
+| Approach | What it does | Tradeoff |
+|----------|----------------|----------|
+| **A1. Worker fold-in** | `machine_id = (pod_base × WEB_CONCURRENCY) + worker_index`. `pod_base` from `SNOWFLAKE_MACHINE_ID` or hostname digits; `worker_index` set in Puma `before_worker_boot`, then `reset!` | Small change; fits current Puma model; organizes the same 1024 slots into per-server ranges. Does **not** expand capacity beyond 1024 processes. Two pods with the same `pod_base` still collide. |
+| **A2. Env-only per process** | Require a unique `SNOWFLAKE_MACHINE_ID` on every worker process | Generator stays dumb. Ops must assign every worker; painful with auto-scale / `WEB_CONCURRENCY=auto`. |
+| **A3. DB lease** | Claim a free row `0..1023` on boot | True multi-host uniqueness without ordinal math. Bigger: schema, locking, crash/lease release, boot depends on DB. |
+
+#### Item 2 — Overflow / boot guard
+
+| Approach | What it does | Tradeoff |
+|----------|----------------|----------|
+| **O1. Raise at worker/process boot** | If final `machine_id` ∉ `0..1023` (optionally if the pod’s full worker range cannot fit), raise during generator init after `before_worker_boot` | Misconfig fails deploy/process start — not a browser 500 on first `shorten`. Preserves “only valid ids are minted.” |
+| **O2. Mask / `% 1024` / clamp** | Force value into range and keep running | Always “starts,” but different bases can map to the same id → hidden collisions. |
+| **O3. Warn + mask** | Log and continue with a truncated id | Soft failure; easy to miss in logs; still unsafe. |
+
+#### Item 3 — Clock step-back / sequence
+
+| Approach | What it does | Tradeoff |
+|----------|----------------|----------|
+| **S1. Logical same-ms (agreed)** | When `current <= last`, keep packing `@last_timestamp` and **increment sequence** only (do not wait on skew; do not pack earlier wall time). On sequence wrap, bounded wait until `current > last` or raise on timeout | Survives short NTP step-back without blocking creates; ids may briefly use an older ms. Wrap still needs a bounded wait/raise. |
+| **S2. Wait on skew (C1/C2)** | When `current < last`, wait until wall clock passes `last` before issuing | Simple “never emit ≤ last” rule; creates pause (or timeout) for the whole skew window. |
+| **S3. Today’s else branch** | On `current < last`, reset sequence and pack `current` | **Duplicates** — not acceptable. |
+
+#### Recommended fix
+
+- **Items 1–2:** **A1** + **O1**. Do **not** mask. Error message includes `pod_base`, `WEB_CONCURRENCY`, `worker_index`, computed id. Optionally raise if `(pod_base + 1) × WEB_CONCURRENCY > 1024`.
+- **Item 3:** **S1** — `current <= last` → sequence++ on `@last_timestamp`; wrap → bounded wait (short sleep) until `current > last`, or raise (e.g. ~1s `ClockWaitTimeout`). Never reuse `(last, 0)` and never spin forever.
+
+#### Related (not required to close US-8)
+
+Bounded `RecordNotUnique` remint on create remains a separate follow-up unless added to the ticket later. DB-leased machine ids (A3) stay a later multi-cluster follow-up.
 
 ## App setup
 

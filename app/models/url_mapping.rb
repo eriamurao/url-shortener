@@ -1,6 +1,7 @@
 class UrlMapping < ApplicationRecord
   # Base62 snowflake ids are 4-11 chars (4 after the first ms past epoch; 11 max for 63-bit ids).
   URL_CODE_FORMAT = /\A[0-9a-zA-Z]{4,11}\z/
+  MAX_REDIRECT_URL_LENGTH = 2048
 
   validates :url_code, presence: true, uniqueness: true, format: { with: URL_CODE_FORMAT }
   validates :redirect_url, presence: true
@@ -25,6 +26,7 @@ class UrlMapping < ApplicationRecord
 
   def safe_redirect_url
     return nil if redirect_url.blank?
+    return nil unless redirect_url.is_a?(String)
 
     uri = URI.parse(redirect_url)
     uri.is_a?(URI::HTTP) && uri.host.present? ? uri.to_s : nil
@@ -35,7 +37,19 @@ class UrlMapping < ApplicationRecord
   private
 
   def long_url_must_be_valid
+    return if redirect_url.nil?
+
+    unless redirect_url.is_a?(String)
+      errors.add(:redirect_url, 'must be a string')
+      return
+    end
+
     return if redirect_url.blank?
+
+    if redirect_url.length > MAX_REDIRECT_URL_LENGTH
+      errors.add(:redirect_url, "is too long (maximum is #{MAX_REDIRECT_URL_LENGTH} characters)")
+      return
+    end
 
     if safe_redirect_url.blank?
       errors.add(:redirect_url, 'must be a valid http or https URL')

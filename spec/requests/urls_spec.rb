@@ -37,6 +37,16 @@ RSpec.describe 'Urls', type: :request do
       expect(response).to have_http_status(:unprocessable_content)
       expect(response.parsed_body['error']).to be_present
     end
+
+    it 'returns validation errors when long_url is not a string' do
+      expect do
+        post shorten_urls_path, params: { long_url: { nested: 'https://example.com' } }
+      end.not_to change(UrlMapping, :count)
+
+      expect(response).to have_http_status(:unprocessable_content)
+      expect(response.parsed_body['error']).to be_an(Array)
+      expect(response.parsed_body['error']).not_to be_empty
+    end
   end
 
   describe 'GET /urls/:id' do

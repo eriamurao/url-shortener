@@ -1,0 +1,19 @@
+---
+description: Git staging and commit boundaries — ask, never assume
+alwaysApply: true
+---
+
+# Git hygiene
+
+- Do **not** assume intent for git actions. If staging, committing, pushing, branching, or resetting is unclear, **ask first**.
+- Do **not** stage files (`git add`, `git restore --staged`, index updates). Leave the working tree unstaged so I can review before staging.
+- Do **not** commit unless I explicitly instruct you to commit.
+- Updating or creating files in the working tree is fine; git index and history changes require my say-so.
+
+```text
+# ❌ BAD — agent stages after editing
+git add README.md app/models/url_mapping.rb
+
+# ✅ GOOD — edit files, leave staging to the user
+# (no git add / commit unless asked)
+```

@@ -77,6 +77,16 @@ RSpec.describe UrlMapping, type: :model do
       expect(mapping).not_to be_valid
       expect(mapping.errors[:redirect_url]).to include('must be a valid http or https URL')
     end
+
+    it 'rejects redirect URLs longer than the max length' do
+      long = "https://example.com/#{'a' * described_class::MAX_REDIRECT_URL_LENGTH}"
+      mapping = build(:url_mapping, redirect_url: long)
+
+      expect(mapping).not_to be_valid
+      expect(mapping.errors[:redirect_url]).to include(
+        "is too long (maximum is #{described_class::MAX_REDIRECT_URL_LENGTH} characters)"
+      )
+    end
   end
 
   describe '#safe_redirect_url' do

@@ -9,7 +9,7 @@ class UrlsController < ApplicationController
     end
   end
 
-  # Important: Since allow_other_host: true is triggers a warning in Brakeman.
+  # Important: allow_other_host: true triggers a warning in Brakeman.
   #   Since this is an intentional open redirect, we should ignore the warning.
   #   When updating this code, make sure to update the fingerprint in config/brakeman.ignore.
   #   Run `bin/rails brakeman:sync_ignore` to update the ignore file.
